@@ -1,7 +1,15 @@
+sudo: false
 language: erlang
-notifications:
-  email: you@example.org
-otp_release:
-  - 18.0
-  - 17.4
-  - R16B
+
+matrix:
+  include:
+    - otp_release: 22.0
+    - otp_release: 21.3
+    - otp_release: 20.3
+    - otp_release: 19.3
+    - otp_release: 18.3
+      dist: trusty
+script:
+  - make test
+  #- make xref
+  - make dialyze

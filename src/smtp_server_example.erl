@@ -20,7 +20,7 @@
 -type(error_message() :: {'error', string(), #state{}}).
 
 %% @doc Initialize the callback module's state for a new session.
-%% The arguments to the function are the SMTP server's hostname (for use in the SMTP anner),
+%% The arguments to the function are the SMTP server's hostname (for use in the SMTP banner),
 %% The number of current sessions (eg. so you can do session limiting), the IP address of the
 %% connecting client, and a freeform list of options for the module. The Options are extracted
 %% from the `callbackoptions' parameter passed into the `gen_smtp_server_session' when it was
@@ -31,7 +31,8 @@
 %% to ALL subsequent calls to the callback module, so it can be used to keep track of the SMTP
 %% session. You can also return `{stop, Reason, Message}' where the session will exit with Reason
 %% and send Message to the client.
--spec init(Hostname :: binary(), SessionCount :: non_neg_integer(), Address :: tuple(), Options :: list()) -> {'ok', string(), #state{}} | {'stop', any(), string()}.
+-spec init(Hostname :: inet:hostname(), SessionCount :: non_neg_integer(),
+           Address :: inet:ip_address(), Options :: list()) -> {'ok', iodata(), #state{}} | {'stop', any(), iodata()}.
 init(Hostname, SessionCount, Address, Options) ->
 	io:format("peer: ~p~n", [Address]),
 	case SessionCount > 20 of
@@ -60,7 +61,9 @@ handle_HELO(<<"trusted_host">>, State) ->
 	{ok, State}; %% no size limit because we trust them.
 handle_HELO(Hostname, State) ->
 	io:format("HELO from ~s~n", [Hostname]),
-	{ok, 655360, State}. % 640kb of HELO should be enough for anyone.
+	% 640kb of HELO should be enough for anyone.
+	MaxSize = proplists:get_value(size, State#state.options, 655360),
+	{ok, MaxSize, State}.
 	%If {ok, State} was returned here, we'd use the default 10mb limit
 
 %% @doc Handle the EHLO verb from the client. As with EHLO the hostname is provided as an argument,
@@ -77,14 +80,22 @@ handle_EHLO(<<"invalid">>, _Extensions, State) ->
 handle_EHLO(Hostname, Extensions, State) ->
 	io:format("EHLO from ~s~n", [Hostname]),
 	% You can advertise additional extensions, or remove some defaults
-	MyExtensions = case proplists:get_value(auth, State#state.options, false) of
+	MyExtensions1 = case proplists:get_value(auth, State#state.options, false) of
 		true ->
 			% auth is enabled, so advertise it
 			Extensions ++ [{"AUTH", "PLAIN LOGIN CRAM-MD5"}, {"STARTTLS", true}];
 		false ->
 			Extensions
 	end,
-	{ok, MyExtensions, State}.
+	MyExtensions2 = case proplists:get_value(size, State#state.options) of
+		undefined ->
+			MyExtensions1;
+		infinity ->
+			[ {"SIZE", "0"} | lists:keydelete("SIZE", 1, MyExtensions1) ];
+		Size when is_integer(Size), Size > 0 ->
+			[ {"SIZE", integer_to_list(Size)} | lists:keydelete("SIZE", 1, MyExtensions1) ]
+	end,
+	{ok, MyExtensions2, State}.
 
 %% @doc Handle the MAIL FROM verb. The From argument is the email address specified by the
 %% MAIL FROM command. Extensions to the MAIL verb are handled by the `handle_MAIL_extension'
@@ -208,6 +219,7 @@ handle_STARTTLS(State) ->
     {noreply, NewState :: term(), timeout() | hibernate} |
     {stop, Reason :: term(), NewState :: term()}.
 handle_info(_Info, State) ->
+    io:format("handle_info(~p, ~p)", [_Info, State]),
 	{noreply, State}.
 
 -spec code_change(OldVsn :: any(), State :: #state{}, Extra :: any()) -> {ok, #state{}}.
@@ -220,13 +232,8 @@ terminate(Reason, State) ->
 
 %%% Internal Functions %%%
 
--ifdef(deprecated_now).
 unique_id() ->
     erlang:unique_integer().
--else.
-unique_id() ->
-    erlang:now().
--endif.
 
 -spec relay(binary(), [binary()], binary()) -> ok.
 relay(_, [], _) ->
