@@ -45,7 +45,7 @@
 
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
--compile(export_all).
+-compile([export_all, nowarn_export_all]).
 -else.
 -export([send/2, send/3, send_blocking/2, open/1, deliver/2, close/1]).
 -endif.
@@ -213,7 +213,7 @@ open(Options) ->
 										_ ->
 											smtp_util:mxlookup(RelayDomain)
 									end,
-			%io:format("MX records for ~s are ~p~n", [RelayDomain, MXRecords]),
+			trace(Options, "MX records for ~s are ~p~n", [RelayDomain, MXRecords]),
 			Hosts = case MXRecords of
 								[] ->
 									[{0, RelayDomain}]; % maybe we're supposed to relay to a host directly
@@ -296,7 +296,7 @@ try_smtp_sessions([{_Distance, Host} | _Tail] = Hosts, Options, RetryList) ->
 	end.
 
 -spec handle_smtp_throw(failure(), [{non_neg_integer(), smtp_host()}], options(), list()) ->
-                               smtp_client_socket() |
+                               {ok, smtp_client_socket()} |
                                smtp_session_error().
 handle_smtp_throw({permanent_failure, Message}, [{_Distance, Host} | _Tail], _Options, _RetryList) ->
 	% permanent failure means no retries, and don't even continue with other hosts
@@ -307,7 +307,7 @@ handle_smtp_throw({temporary_failure, tls_failed}, [{_Distance, Host} | _Tail] =
 		if_available ->
 			NoTLSOptions = [{tls,never} | proplists:delete(tls, Options)],
 			try open_smtp_session(Host, NoTLSOptions) of
-				Res -> Res
+				Res -> {ok, Res}
 			catch
 				throw:FailMsg ->
 					handle_smtp_throw(FailMsg, Hosts, Options, RetryList)
@@ -537,15 +537,17 @@ do_AUTH_each(Socket, Username, Password, ["XOAUTH2" | Tail], Options) ->
 	end;
 do_AUTH_each(Socket, Username, Password, ["LOGIN" | Tail], Options) ->
 	smtp_socket:send(Socket, "AUTH LOGIN\r\n"),
-	case read_possible_multiline_reply(Socket) of
-		%% base64 Username: or username:
-		{ok, Prompt} when Prompt == <<"334 VXNlcm5hbWU6\r\n">>; Prompt == <<"334 dXNlcm5hbWU6\r\n">> ->
+	{ok, Prompt} = read_possible_multiline_reply(Socket),
+    case is_auth_username_prompt(Prompt) of
+        true ->
+    		%% base64 Username: or username:
 			trace(Options, "username prompt~n", []),
 			U = base64:encode(Username),
 			smtp_socket:send(Socket, [U,"\r\n"]),
-			case read_possible_multiline_reply(Socket) of
-				%% base64 Password: or password:
-				{ok, Prompt2} when Prompt2 == <<"334 UGFzc3dvcmQ6\r\n">>; Prompt2 == <<"334 cGFzc3dvcmQ6\r\n">> ->
+			{ok, Prompt2} = read_possible_multiline_reply(Socket),
+            case is_auth_password_prompt(Prompt2) of
+                true ->
+    				%% base64 Password: or password:
 					trace(Options, "password prompt~n", []),
 					P = base64:encode(Password),
 					smtp_socket:send(Socket, [P,"\r\n"]),
@@ -557,12 +559,12 @@ do_AUTH_each(Socket, Username, Password, ["LOGIN" | Tail], Options) ->
 							trace(Options, "password rejected: ~s", [Msg]),
 							do_AUTH_each(Socket, Username, Password, Tail, Options)
 					end;
-				{ok, Msg2} ->
-					trace(Options, "username rejected: ~s", [Msg2]),
+				false ->
+					trace(Options, "username rejected: ~s", [Prompt2]),
 					do_AUTH_each(Socket, Username, Password, Tail, Options)
 			end;
-		{ok, Something} ->
-			trace(Options, "got ~s~n", [Something]),
+		false ->
+			trace(Options, "got ~s~n", [Prompt]),
 			do_AUTH_each(Socket, Username, Password, Tail, Options)
 	end;
 do_AUTH_each(Socket, Username, Password, ["PLAIN" | Tail], Options) ->
@@ -580,6 +582,20 @@ do_AUTH_each(Socket, Username, Password, ["PLAIN" | Tail], Options) ->
 do_AUTH_each(Socket, Username, Password, [Type | Tail], Options) ->
 	trace(Options, "unsupported AUTH type ~s~n", [Type]),
 	do_AUTH_each(Socket, Username, Password, Tail, Options).
+
+
+is_auth_username_prompt(<<"334 VXNlcm5hbWU6\r\n">>) -> true;
+is_auth_username_prompt(<<"334 dXNlcm5hbWU6\r\n">>) -> true;
+is_auth_username_prompt(<<"334 VXNlcm5hbWU6 ", _/binary>>) -> true;
+is_auth_username_prompt(<<"334 dXNlcm5hbWU6 ", _/binary>>) -> true;
+is_auth_username_prompt(_) -> false.
+
+is_auth_password_prompt(<<"334 UGFzc3dvcmQ6\r\n">>) -> true;
+is_auth_password_prompt(<<"334 cGFzc3dvcmQ6\r\n">>) -> true;
+is_auth_password_prompt(<<"334 UGFzc3dvcmQ6 ", _/binary>>) -> true;
+is_auth_password_prompt(<<"334 cGFzc3dvcmQ6 ", _/binary>>) -> true;
+is_auth_password_prompt(_) -> false.
+
 
 -spec try_EHLO(Socket :: smtp_socket:socket(), Options :: options()) -> {ok, extensions()}.
 try_EHLO(Socket, Options) ->
@@ -642,7 +658,7 @@ do_STARTTLS(Socket, Options) ->
 	smtp_socket:send(Socket, "STARTTLS\r\n"),
 	case read_possible_multiline_reply(Socket) of
 		{ok, <<"220", _Rest/binary>>} ->
-			case catch smtp_socket:to_ssl_client(Socket, proplists:get_value(tls_options, Options, []), 5000) of
+			case catch smtp_socket:to_ssl_client(Socket, [binary | proplists:get_value(tls_options, Options, [])], 5000) of
 				{ok, NewSocket} ->
 					%NewSocket;
 					{ok, Extensions} = try_EHLO(NewSocket, Options),
@@ -1027,9 +1043,10 @@ session_start_test_() ->
 								?assertMatch({ok, "EHLO testing\r\n"}, smtp_socket:recv(X, 0, 1000)),
 								smtp_socket:send(X, "250-hostname\r\n250 STARTTLS\r\n"),
 								?assertMatch({ok, "STARTTLS\r\n"}, smtp_socket:recv(X, 0, 1000)),
-								gen_smtp_application:ensure_all_started(gen_smtp),
+								application:ensure_all_started(gen_smtp),
 								smtp_socket:send(X, "220 ok\r\n"),
-								{ok, Y} = smtp_socket:to_ssl_server(X, [{certfile, "test/fixtures/server.crt"}, {keyfile, "test/fixtures/server.key"}], 5000),
+								{ok, Y} = smtp_socket:to_ssl_server(X, [{certfile, "test/fixtures/mx1.example.com-server.crt"},
+																		{keyfile, "test/fixtures/mx1.example.com-server.key"}], 5000),
 								?assertMatch({ok, "EHLO testing\r\n"}, smtp_socket:recv(Y, 0, 1000)),
 								smtp_socket:send(Y, "250-hostname\r\n250 STARTTLS\r\n"),
 								?assertMatch({ok, "MAIL FROM:<test@foo.com>\r\n"}, smtp_socket:recv(Y, 0, 1000)),
@@ -1056,9 +1073,44 @@ session_start_test_() ->
 								?assertMatch({ok, "EHLO testing\r\n"}, smtp_socket:recv(X, 0, 1000)),
 								smtp_socket:send(X, "250-hostname\r\n250 STARTTLS\r\n"),
 								?assertMatch({ok, "STARTTLS\r\n"}, smtp_socket:recv(X, 0, 1000)),
-								gen_smtp_application:ensure_all_started(gen_smtp),
+								application:ensure_all_started(gen_smtp),
 								smtp_socket:send(X, "220 ok\r\n"),
-								{ok, Y} = smtp_socket:to_ssl_server(X, [{certfile, "test/fixtures/server.crt"}, {keyfile, "test/fixtures/server.key"}], 5000),
+								{ok, Y} = smtp_socket:to_ssl_server(X, [{certfile, "test/fixtures/mx1.example.com-server.crt"},
+																		{keyfile, "test/fixtures/mx1.example.com-server.key"}], 5000),
+								?assertMatch({ok, "EHLO testing\r\n"}, smtp_socket:recv(Y, 0, 1000)),
+								smtp_socket:send(Y, "250-hostname\r\n250 STARTTLS\r\n"),
+								?assertMatch({ok, "MAIL FROM:<test@foo.com>\r\n"}, smtp_socket:recv(Y, 0, 1000)),
+								smtp_socket:send(Y, "250 ok\r\n"),
+								?assertMatch({ok, "RCPT TO:<foo@bar.com>\r\n"}, smtp_socket:recv(Y, 0, 1000)),
+								smtp_socket:send(Y, "250 ok\r\n"),
+								?assertMatch({ok, "DATA\r\n"}, smtp_socket:recv(Y, 0, 1000)),
+								smtp_socket:send(Y, "354 ok\r\n"),
+								?assertMatch({ok, "hello world\r\n"}, smtp_socket:recv(Y, 0, 1000)),
+								?assertMatch({ok, ".\r\n"}, smtp_socket:recv(Y, 0, 1000)),
+								smtp_socket:send(Y, "250 ok\r\n"),
+								?assertMatch({ok, "QUIT\r\n"}, smtp_socket:recv(Y, 0, 1000)),
+								ok
+						end
+					}
+			end,
+			fun({ListenSock}) ->
+					{"Transaction with TLS advertised, but broken, should be restarted without TLS, if allowed",
+						fun() ->
+								Options = [{relay, "localhost"}, {port, 9876}, {hostname, <<"testing">>}, {tls, if_available}],
+								{ok, _Pid} = send({<<"test@foo.com">>, [<<"foo@bar.com">>], <<"hello world">>}, Options),
+								{ok, X} = smtp_socket:accept(ListenSock, 1000),
+								smtp_socket:send(X, "220 Some banner\r\n"),
+								?assertMatch({ok, "EHLO testing\r\n"}, smtp_socket:recv(X, 0, 1000)),
+								smtp_socket:send(X, "250-hostname\r\n250 STARTTLS\r\n"),
+								?assertMatch({ok, "STARTTLS\r\n"}, smtp_socket:recv(X, 0, 1000)),
+								smtp_socket:send(X, "220 ok\r\n"),
+								%% Now, send some invalid data instead of TLS handshake and close the socket
+								{ok, [22, V1, V2 | _]} = smtp_socket:recv(X, 0, 1000),
+								smtp_socket:send(X, [22, V1, V2, 0, 0]),
+								smtp_socket:close(X),
+								%% Client would make another attempt to connect, without TLS
+								{ok, Y} = smtp_socket:accept(ListenSock, 1000),
+								smtp_socket:send(Y, "220 Some banner\r\n"),
 								?assertMatch({ok, "EHLO testing\r\n"}, smtp_socket:recv(Y, 0, 1000)),
 								smtp_socket:send(Y, "250-hostname\r\n250 STARTTLS\r\n"),
 								?assertMatch({ok, "MAIL FROM:<test@foo.com>\r\n"}, smtp_socket:recv(Y, 0, 1000)),
@@ -1138,6 +1190,28 @@ session_start_test_() ->
 						end
 					}
 			end,
+            fun({ListenSock}) ->
+                    {"AUTH LOGIN should work with appended methods",
+                        fun() ->
+                                Options = [{relay, "localhost"}, {port, 9876}, {hostname, "testing"}, {username, "user"}, {password, "pass"}],
+                                {ok, _Pid} = send({"test@foo.com", ["foo@bar.com"], "hello world"}, Options),
+                                {ok, X} = smtp_socket:accept(ListenSock, 1000),
+                                smtp_socket:send(X, "220 Some banner\r\n"),
+                                ?assertMatch({ok, "EHLO testing\r\n"}, smtp_socket:recv(X, 0, 1000)),
+                                smtp_socket:send(X, "250-hostname\r\n250 AUTH LOGIN\r\n"),
+                                ?assertEqual({ok, "AUTH LOGIN\r\n"}, smtp_socket:recv(X, 0, 1000)),
+                                smtp_socket:send(X, "334 VXNlcm5hbWU6 R6S4yT8pcW5sQjZD3CW61N0 - hssmtp\r\n"),
+                                UserString = binary_to_list(base64:encode("user")),
+                                ?assertEqual({ok, UserString++"\r\n"}, smtp_socket:recv(X, 0, 1000)),
+                                smtp_socket:send(X, "334 UGFzc3dvcmQ6 R6S4yT8pcW5sQjZD3CW61N0 - hssmtp\r\n"),
+                                PassString = binary_to_list(base64:encode("pass")),
+                                ?assertEqual({ok, PassString++"\r\n"}, smtp_socket:recv(X, 0, 1000)),
+                                smtp_socket:send(X, "235 ok\r\n"),
+                                ?assertMatch({ok, "MAIL FROM:<test@foo.com>\r\n"}, smtp_socket:recv(X, 0, 1000)),
+                                ok
+                        end
+                    }
+            end,
 			fun({ListenSock}) ->
 					{"AUTH CRAM-MD5 should work",
 						fun() ->
@@ -1223,8 +1297,9 @@ session_start_test_() ->
 			fun({_ListenSock}) ->
 					{"Connecting to a SSL socket directly should work",
 						fun() ->
-								gen_smtp_application:ensure_all_started(gen_smtp),
-								{ok, ListenSock} = smtp_socket:listen(ssl, 9877, [{certfile, "test/fixtures/server.crt"}, {keyfile, "test/fixtures/server.key"}]),
+								application:ensure_all_started(gen_smtp),
+								{ok, ListenSock} = smtp_socket:listen(ssl, 9877, [{certfile, "test/fixtures/mx1.example.com-server.crt"},
+																				  {keyfile, "test/fixtures/mx1.example.com-server.key"}]),
 								Options = [{relay, <<"localhost">>}, {port, 9877}, {hostname, <<"testing">>}, {ssl, true}],
 								{ok, _Pid} = send({<<"test@foo.com">>, [<<"<foo@bar.com>">>, <<"baz@bar.com">>], <<"hello world">>}, Options),
 								{ok, X} = smtp_socket:accept(ListenSock, 1000),
@@ -1246,6 +1321,19 @@ session_start_test_() ->
 								smtp_socket:close(ListenSock),
 								ok
 						end
+					},
+
+					{"Erlang 23.2.7 compatibility",
+					 fun() ->
+							 Receipt = gen_smtp_client:send_blocking({<<"Info.ContactTracing@sg.ch">>, [<<"maennchen@joshmartin.ch">>], <<"test">>},
+																	 [{relay, <<"joshmartin.ch">>},
+																	  {port, 25},
+																	  {hostname, "smtp.covid19-tracing.ch"},
+																	  {retries, 10}]
+																	),
+							 ?assertMatch({error, send, _}, Receipt),
+							 ok
+					 end
 					}
 			end
 

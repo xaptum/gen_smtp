@@ -56,6 +56,7 @@
 -endif.
 
 -export([encode/1, encode/2, decode/2, decode/1, get_header_value/2, get_header_value/3, parse_headers/1]).
+-export([encode_quoted_printable/1, decode_quoted_printable/1]).
 
 -export_type([mimetuple/0,
               mime_type/0,
@@ -64,6 +65,8 @@
               parameters/0,
               options/0,
               dkim_options/0]).
+
+-include_lib("hut/include/hut.hrl").
 
 -define(DEFAULT_MIME_VERSION, <<"1.0">>).
 
@@ -74,9 +77,9 @@
 		{default_mime_version, ?DEFAULT_MIME_VERSION} % default mime version
 	]).
 
--type mime_type() :: binary().                  % <<"text">>
--type mime_subtype() :: binary().               % <<"plain">>
--type headers() :: [{binary(), binary()}].      % [{<<"Content-Type">>, <<"text/plain">>}]
+-type mime_type() :: binary().                  % `<<"text">>'
+-type mime_subtype() :: binary().               % `<<"plain">>'
+-type headers() :: [{binary(), binary()}].      % `[{<<"Content-Type">>, <<"text/plain">>}]'
 -type parameters() ::
         #{transfer_encoding => binary(),
           %% [{<<"charset">>, <<"utf-8">>} | {<<"boundary">>, binary()} | {<<"name">>, binary()} etc...]
@@ -122,7 +125,7 @@ decode(All, Options) when is_binary(All), is_list(Options) ->
 	decode(Headers, Body, Options).
 
 decode(OrigHeaders, Body, Options) ->
-	%io:format("headers: ~p~n", [Headers]),
+	?log(debug, "headers: ~p~n", [OrigHeaders]),
 	Encoding = proplists:get_value(encoding, Options, none),
 	%FixedHeaders = fix_headers(Headers),
 	Headers = decode_headers(OrigHeaders, [], Encoding),
@@ -169,7 +172,7 @@ encode({Type, Subtype, Headers, ContentTypeParams, Parts}, Options) ->
 					"\r\n\r\n",
 					EncodedBody]);
 encode(_, _) ->
-	io:format("Not a mime-decoded DATA~n"),
+	?log(debug, "Not a mime-decoded DATA~n"),
 	erlang:error(non_mime).
 
 
@@ -297,7 +300,7 @@ decode_component(Headers, Body, MimeVsn = <<"1.0", _/binary>>, Options) ->
 				undefined ->
 					erlang:error(no_boundary);
 				Boundary ->
-					% io:format("this is a multipart email of type:  ~s and boundary ~s~n", [SubType, Boundary]),
+					?log(debug, "this is a multipart email of type:  ~s and boundary ~s~n", [SubType, Boundary]),
 					Parameters2 = #{content_type_params => Parameters,
                                     disposition => Disposition,
                                     disposition_params => DispositionParams},
@@ -310,7 +313,7 @@ decode_component(Headers, Body, MimeVsn = <<"1.0", _/binary>>, Options) ->
                             disposition_params => DispositionParams},
 			{<<"message">>, <<"rfc822">>, Headers, Parameters2, decode(NewHeaders, NewBody, Options)};
 		{Type, SubType, Parameters} ->
-			%io:format("body is ~s/~s~n", [Type, SubType]),
+			?log(debug, "body is ~s/~s~n", [Type, SubType]),
 			Parameters2 = #{content_type_params => Parameters,
                             disposition => Disposition,
                             disposition_params => DispositionParams},
@@ -329,7 +332,7 @@ decode_component(_Headers, _Body, Other, _Options) ->
 -spec get_header_value(Needle :: binary(), Headers :: [{binary(), binary()}], Default :: any()) -> binary() | any().
 %% @doc Do a case-insensitive header lookup to return that header's value, or the specified default.
 get_header_value(Needle, Headers, Default) ->
-	%io:format("Headers: ~p~n", [Headers]),
+	?log(debug, "Headers: ~p~n", [Headers]),
 	F =
 	fun({Header, _Value}) ->
 			binstr:to_lower(Header) =:= binstr:to_lower(Needle)
@@ -472,7 +475,7 @@ parse_headers(Body, <<H, T/binary>>, Headers) when H =:= $\s; H =:= $\t ->
 	% folded headers
 	[{FieldName, OldFieldValue} | OtherHeaders] = Headers,
 	FieldValue = list_to_binary([OldFieldValue, T]),
-	%io:format("~p = ~p~n", [FieldName, FieldValue]),
+	?log(debug, "~p = ~p~n", [FieldName, FieldValue]),
 	case binstr:strpos(Body, "\r\n") of
 		0 ->
 			{lists:reverse([{FieldName, FieldValue} | OtherHeaders]), Body};
@@ -482,7 +485,7 @@ parse_headers(Body, <<H, T/binary>>, Headers) when H =:= $\s; H =:= $\t ->
 			parse_headers(binstr:substr(Body, Index2 + 2), binstr:substr(Body, 1, Index2 - 1), [{FieldName, FieldValue} | OtherHeaders])
 	end;
 parse_headers(Body, Line, Headers) ->
-	%io:format("line: ~p, nextpart ~p~n", [Line, binstr:substr(Body, 1, 10)]),
+	?log(debug, "line: ~p", [Line]),
 	case binstr:strchr(Line, $:) of
 		0 ->
 			{lists:reverse(Headers), list_to_binary([Line, "\r\n", Body])};
@@ -562,7 +565,7 @@ decode_quoted_printable(Line, Rest, Acc) ->
 		0 ->
 			decode_quoted_printable(Rest, <<>>, [decode_quoted_printable_line(Line, []) | Acc]);
 		Index ->
-			%io:format("next line ~p~nnext rest ~p~n", [binstr:substr(Rest, 1, Index +1), binstr:substr(Rest, Index + 2)]),
+			?log(debug, "next line ~p~nnext rest ~p~n", [binstr:substr(Rest, 1, Index +1), binstr:substr(Rest, Index + 2)]),
 			decode_quoted_printable(binstr:substr(Rest, 1, Index +1), binstr:substr(Rest, Index + 2),
 				[decode_quoted_printable_line(Line, []) | Acc])
 	end.
@@ -650,79 +653,79 @@ check_headers([Header | Tail], Headers) ->
 
 ensure_content_headers(Type, SubType, Parameters, Headers, Body, Toplevel) ->
 	CheckHeaders = [<<"Content-Type">>, <<"Content-Disposition">>, <<"Content-Transfer-Encoding">>],
-	ensure_content_headers(CheckHeaders, Type, SubType, Parameters, lists:reverse(Headers), Body, Toplevel).
+	CheckHeadersValues = [{Name, get_header_value(Name, Headers)} || Name <- CheckHeaders],
+	ensure_content_headers(CheckHeadersValues, Type, SubType, Parameters, lists:reverse(Headers), Body, Toplevel).
 
 ensure_content_headers([], _, _, Parameters, Headers, _, _) ->
 	{Parameters, lists:reverse(Headers)};
-ensure_content_headers([Header | Tail], Type, SubType, Parameters, Headers, Body, Toplevel) ->
-	case get_header_value(Header, Headers) of
-		undefined when Header == <<"Content-Type">>, ((Type == <<"text">> andalso SubType =/= <<"plain">>) orelse Type =/= <<"text">>) ->
-			% no content-type header, and its not text/plain
-			CT = io_lib:format("~s/~s", [Type, SubType]),
-			CTP = case Type of
-				<<"multipart">> ->
-					Boundary = case proplists:get_value(<<"boundary">>, maps:get(content_type_params, Parameters, [])) of
-						undefined ->
-							list_to_binary(smtp_util:generate_message_boundary());
-						B ->
-							B
-					end,
-					[{<<"boundary">>, Boundary} | proplists:delete(<<"boundary">>, maps:get(content_type_params, Parameters, []))];
-				<<"text">> ->
-					Charset = case proplists:get_value(<<"charset">>, maps:get(content_type_params, Parameters, [])) of
-						undefined ->
-							guess_charset(Body);
-						C ->
-							C
-					end,
-					[{<<"charset">>, Charset} | proplists:delete(<<"charset">>, maps:get(content_type_params, Parameters, []))];
-				_ ->
-					maps:get(content_type_params, Parameters, [])
-			end,
+ensure_content_headers([{<<"Content-Type">>, undefined} | Tail], Type, SubType, Parameters, Headers, Body, Toplevel)
+  when (Type == <<"text">> andalso SubType =/= <<"plain">>) orelse Type =/= <<"text">> ->
+	%% no content-type header, and its not text/plain
+	CT = io_lib:format("~s/~s", [Type, SubType]),
+	CTP = case Type of
+			  <<"multipart">> ->
+				  Boundary = case proplists:get_value(<<"boundary">>, maps:get(content_type_params, Parameters, [])) of
+								 undefined ->
+									 list_to_binary(smtp_util:generate_message_boundary());
+								 B ->
+									 B
+							 end,
+				  [{<<"boundary">>, Boundary} | proplists:delete(<<"boundary">>, maps:get(content_type_params, Parameters, []))];
+			  <<"text">> ->
+				  Charset = case proplists:get_value(<<"charset">>, maps:get(content_type_params, Parameters, [])) of
+								undefined ->
+									guess_charset(Body);
+								C ->
+									C
+							end,
+				  [{<<"charset">>, Charset} | proplists:delete(<<"charset">>, maps:get(content_type_params, Parameters, []))];
+			  _ ->
+				  maps:get(content_type_params, Parameters, [])
+		  end,
 
-			%CTP = proplists:get_value(<<"content-type-params">>, Parameters, [guess_charset(Body)]),
-			CTH = binstr:join([CT | encode_parameters(CTP)], ";"),
-			NewParameters = Parameters#{content_type_params => CTP},
-			ensure_content_headers(Tail, Type, SubType, NewParameters, [{<<"Content-Type">>, CTH} | Headers], Body, Toplevel);
-		undefined when Header == <<"Content-Type">> ->
-			% no content-type header and its text/plain
-			Charset = case proplists:get_value(<<"charset">>, maps:get(content_type_params, Parameters, [])) of
-				undefined ->
-					guess_charset(Body);
-				C ->
-					binstr:to_lower(C)
-			end,
-			case Charset of
-				<<"us-ascii">> ->
-					% the default
-					ensure_content_headers(Tail, Type, SubType, Parameters, Headers, Body, Toplevel);
-				_ ->
-					CTP = [{<<"charset">>, Charset} | proplists:delete(<<"charset">>, maps:get(content_type_params, Parameters, []))],
-					CTH = binstr:join([<<"text/plain">> | encode_parameters(CTP)], ";"),
-					NewParameters = Parameters#{content_type_params => CTP},
-					ensure_content_headers(Tail, Type, SubType, NewParameters, [{<<"Content-Type">>, CTH} | Headers], Body, Toplevel)
-			end;
-		undefined when Header == <<"Content-Transfer-Encoding">>, Type =/= <<"multipart">> ->
-			Enc = case maps:get(transfer_encoding, Parameters, undefined) of
-				undefined ->
-					guess_best_encoding(Body);
-				Value ->
-					Value
-			end,
-			case Enc of
-				<<"7bit">> ->
-					ensure_content_headers(Tail, Type, SubType, Parameters, Headers, Body, Toplevel);
-				_ ->
-					ensure_content_headers(Tail, Type, SubType, Parameters, [{<<"Content-Transfer-Encoding">>, Enc} | Headers], Body, Toplevel)
-			end;
-		undefined when Header == <<"Content-Disposition">>, Toplevel == false ->
-			CD = maps:get(disposition, Parameters, <<"inline">>),
-			CDP = maps:get(disposition_params, Parameters, []),
-			CDH = binstr:join([CD | encode_parameters(CDP)], ";"),
-			ensure_content_headers(Tail, Type, SubType, Parameters, [{<<"Content-Disposition">>, CDH} | Headers], Body, Toplevel);
+	%%CTP = proplists:get_value(<<"content-type-params">>, Parameters, [guess_charset(Body)]),
+	CTH = binstr:join([CT | encode_parameters(CTP)], ";"),
+	NewParameters = Parameters#{content_type_params => CTP},
+	ensure_content_headers(Tail, Type, SubType, NewParameters, [{<<"Content-Type">>, CTH} | Headers], Body, Toplevel);
+ensure_content_headers([{<<"Content-Type">>, undefined} | Tail], <<"text">> = Type, <<"plain">> = SubType, Parameters, Headers, Body, Toplevel) ->
+	%% no content-type header and its text/plain
+	Charset = case proplists:get_value(<<"charset">>, maps:get(content_type_params, Parameters, [])) of
+				  undefined ->
+					  guess_charset(Body);
+				  C ->
+					  binstr:to_lower(C)
+			  end,
+	case Charset of
+		<<"us-ascii">> ->
+												% the default
+			ensure_content_headers(Tail, Type, SubType, Parameters, Headers, Body, Toplevel);
 		_ ->
-			ensure_content_headers(Tail, Type, SubType, Parameters, Headers, Body, Toplevel)
-	end.
+			CTP = [{<<"charset">>, Charset} | proplists:delete(<<"charset">>, maps:get(content_type_params, Parameters, []))],
+			CTH = binstr:join([<<"text/plain">> | encode_parameters(CTP)], ";"),
+			NewParameters = Parameters#{content_type_params => CTP},
+			ensure_content_headers(Tail, Type, SubType, NewParameters, [{<<"Content-Type">>, CTH} | Headers], Body, Toplevel)
+	end;
+ensure_content_headers([{<<"Content-Transfer-Encoding">>, undefined} | Tail], Type, SubType, Parameters, Headers, Body, Toplevel)
+  when Type =/= <<"multipart">> ->
+	Enc = case maps:get(transfer_encoding, Parameters, undefined) of
+			  undefined ->
+				  guess_best_encoding(Body);
+			  Value ->
+				  Value
+		  end,
+	case Enc of
+		<<"7bit">> ->
+			ensure_content_headers(Tail, Type, SubType, Parameters, Headers, Body, Toplevel);
+		_ ->
+			ensure_content_headers(Tail, Type, SubType, Parameters, [{<<"Content-Transfer-Encoding">>, Enc} | Headers], Body, Toplevel)
+	end;
+ensure_content_headers([{<<"Content-Disposition">>, undefined} | Tail], Type, SubType, Parameters, Headers, Body, false = Toplevel) ->
+	CD = maps:get(disposition, Parameters, <<"inline">>),
+	CDP = maps:get(disposition_params, Parameters, []),
+	CDH = binstr:join([CD | encode_parameters(CDP)], ";"),
+	ensure_content_headers(Tail, Type, SubType, Parameters, [{<<"Content-Disposition">>, CDH} | Headers], Body, Toplevel);
+ensure_content_headers([_ | Tail], Type, SubType, Parameters, Headers, Body, Toplevel) ->
+	ensure_content_headers(Tail, Type, SubType, Parameters, Headers, Body, Toplevel).
 
 guess_charset(Body) ->
 	case binstr:all(fun(X) -> X < 128 end, Body) of
@@ -730,11 +733,18 @@ guess_charset(Body) ->
 		false -> <<"utf-8">>
 	end.
 
-guess_best_encoding(<<Body:200/binary, Rest/binary>>) when Rest =/= <<>> ->
-	guess_best_encoding(Body);
-guess_best_encoding(<<>>) ->
-    <<"7bit">>;
 guess_best_encoding(Body) ->
+	case valid_7bit(Body) of
+		true ->
+			<<"7bit">>;
+		false ->
+			choose_transformation(Body)
+	end.
+
+choose_transformation(<<Chunk:200/binary, _, _/binary>>) ->
+	%% Optimization - only analyze 1st 200 bytes
+	choose_transformation(Chunk);
+choose_transformation(Body) ->
 	Size = byte_size(Body),
 	% get only the allowed ascii characters
 	% TODO - this might not be the complete list
@@ -744,13 +754,51 @@ guess_best_encoding(Body) ->
 
 	%based on the % of printable characters, choose an encoding
 	if
-		Percent == 100 ->
-			<<"7bit">>;
 		Percent > 80 ->
 			<<"quoted-printable">>;
 		true ->
 			<<"base64">>
 	end.
+
+%% https://tools.ietf.org/html/rfc2045#section-2.7:
+%% * ASCII codes from 1 to 127
+%% * \r and \n are ony allowed as `\r\n' pair, but not standalone (bare)
+%% * No lines over 998 chars
+%%
+%% Unfortunately, any string that ends with `\n` matches the regexp, so, we need some pre-checks
+valid_7bit(<<"\n">>) -> false;
+valid_7bit(<<"\r">>) -> false;
+valid_7bit(<<>>) -> true;
+valid_7bit(<<_>>) -> true;
+valid_7bit(Body) ->
+	Size = byte_size(Body),
+	case binary:at(Body, Size - 1) =:= $\n andalso binary:at(Body, Size - 2) =/= $\r of
+		true ->
+			%% last element is \n, but the one before the last is not \r
+			false;
+		false ->
+			%% So: (all except `\r` and `\n` in 1-127 range) OR (`\r\n`)
+			case re:run(Body, "^([\x01-\x09\x0b-\x0c\x0e-\x7f]|(\r\n))*$", [{capture, none}]) of
+				match -> not has_lines_over_998(Body);
+				nomatch -> false
+			end
+	end.
+
+%% @doc If `Body' has at least one line (ending with `\r\n') that is longer than 998 chars
+has_lines_over_998(Body) ->
+	Pattern = binary:compile_pattern(<<"\r\n">>),
+	has_lines_over_998(Body, binary:match(Body, Pattern), 0, Pattern).
+
+has_lines_over_998(Bin, nomatch, Offset, _) ->
+	%% Last line is over 998?
+	(byte_size(Bin) - Offset) >= 998;
+has_lines_over_998(_Bin, {FoundAt, 2}, Offset, _Patern) when (FoundAt - Offset) >= 998 ->
+	true;
+has_lines_over_998(Bin, {FoundAt, 2}, _, Pattern) ->
+	NewOffset = FoundAt + 2,
+	Len = byte_size(Bin) - NewOffset,
+	has_lines_over_998(
+	  Bin, binary:match(Bin, Pattern, [{scope, {NewOffset, Len}}]), NewOffset, Pattern).
 
 encode_parameters([[]]) ->
 	[];
@@ -815,48 +863,44 @@ encode_header_value(H, Value) when H =:= <<"To">>; H =:= <<"Cc">>; H =:= <<"Bcc"
 encode_header_value(_, Value) ->
 	rfc2047_utf8_encode(Value).
 
-encode_component(_Type, _SubType, Headers, Params, Body) ->
-	if
-		is_list(Body) -> % is this a multipart component?
-			Boundary = proplists:get_value(<<"boundary">>, maps:get(content_type_params, Params)),
-			[<<>>] ++  % blank line before start of component
-			lists:flatmap(
-				fun(Part) ->
-						[list_to_binary([<<"--">>, Boundary])] ++ % start with the boundary
-						encode_component_part(Part)
-				end,
-				Body
-			) ++ [list_to_binary([<<"--">>, Boundary, <<"--">>])] % final boundary (with /--$/)
-			  ++ [<<>>]; % blank line at the end of the multipart component
-		true -> % or an inline component?
-			%encode_component_part({Type, SubType, Headers, Params, Body})
-			encode_body(
-					get_header_value(<<"Content-Transfer-Encoding">>, Headers),
-					[Body]
-			 )
-	end.
+encode_component(_Type, _SubType, _Headers, Params, Body) when is_list(Body) ->
+    % is this a multipart component?
+	Boundary = proplists:get_value(<<"boundary">>, maps:get(content_type_params, Params)),
+	[<<>>] ++  % blank line before start of component
+	lists:flatmap(
+		fun(Part) ->
+				[list_to_binary([<<"--">>, Boundary])] ++ % start with the boundary
+				encode_component_part(Part)
+		end,
+		Body
+	) ++ [list_to_binary([<<"--">>, Boundary, <<"--">>])] % final boundary (with /--$/)
+	  ++ [<<>>]; % blank line at the end of the multipart component
+encode_component(_Type, _SubType, Headers, _Params, Body) ->
+    % or an inline component?
+	%encode_component_part({Type, SubType, Headers, Params, Body})
+	encode_body(
+		get_header_value(<<"Content-Transfer-Encoding">>, Headers),
+		[Body]
+	).
 
+encode_component_part({<<"multipart">>, SubType, Headers, PartParams, Body}) ->
+	{FixedParams, FixedHeaders} = ensure_content_headers(<<"multipart">>, SubType, PartParams, Headers, Body, false),
+	encode_headers(FixedHeaders) ++
+	encode_component(<<"multipart">>, SubType, FixedHeaders, FixedParams, Body);
+encode_component_part({Type, SubType, Headers, PartParams, Body}) ->
+	PartData = case Body of
+		{_,_,_,_,_} -> encode_component_part(Body);
+		String      -> [String]
+	end,
+	{_FixedParams, FixedHeaders} = ensure_content_headers(Type, SubType, PartParams, Headers, Body, false),
+	encode_headers(FixedHeaders) ++ [<<>>] ++
+	encode_body(
+			get_header_value(<<"Content-Transfer-Encoding">>, FixedHeaders),
+			PartData
+	 );
 encode_component_part(Part) ->
-	case Part of
-		{<<"multipart">>, SubType, Headers, PartParams, Body} ->
-			{FixedParams, FixedHeaders} = ensure_content_headers(<<"multipart">>, SubType, PartParams, Headers, Body, false),
-			encode_headers(FixedHeaders) ++ [<<>>] ++
-			encode_component(<<"multipart">>, SubType, FixedHeaders, FixedParams, Body);
-		{Type, SubType, Headers, PartParams, Body} ->
-			PartData = case Body of
-				{_,_,_,_,_} -> encode_component_part(Body);
-				String      -> [String]
-			end,
-			{_FixedParams, FixedHeaders} = ensure_content_headers(Type, SubType, PartParams, Headers, Body, false),
-			encode_headers(FixedHeaders) ++ [<<>>] ++
-			encode_body(
-					get_header_value(<<"Content-Transfer-Encoding">>, FixedHeaders),
-					PartData
-			 );
-		_ ->
-			io:format("encode_component_part couldn't match Part to: ~p~n", [Part]),
-			[]
-	end.
+	?log(debug, "encode_component_part couldn't match Part to: ~p~n", [Part]),
+	[].
 
 encode_body(undefined, Body) ->
 	Body;
@@ -901,10 +945,8 @@ encode_quoted_printable(Body, Acc, L) when L >= 75 ->
 			encode_quoted_printable(Body, [$\n, $\r, $= | Acc], 0);
 		SIndex when (L - 75) < SIndex ->
 			% okay, we can safely stick some whitespace in
-			Prefix = string:substr(Acc, 1, SIndex-1),
-			Suffix = string:substr(Acc, SIndex),
-			NewAcc = lists:concat([Prefix, "\n\r=", Suffix]),
-			encode_quoted_printable(Body, NewAcc, 0);
+			NewAcc = insert_soft_newline(Acc, SIndex - 1),
+			encode_quoted_printable(Body, NewAcc, SIndex);
 		_ ->
 			% worst case, we're over 75 characters on the line
 			% and there's no obvious break points, just stick one
@@ -914,10 +956,8 @@ encode_quoted_printable(Body, Acc, L) when L >= 75 ->
 
 			% TODO - fix this to be less stupid
 			I = 3, % assume we're at most 3 over our cutoff
-			Prefix = string:substr(Acc, 1, I),
-			Suffix = string:substr(Acc, I+1),
-			NewAcc = lists:concat([Prefix, "\n\r=", Suffix]),
-			encode_quoted_printable(Body, NewAcc, 0)
+			NewAcc = insert_soft_newline(Acc, I),
+			encode_quoted_printable(Body, NewAcc, I)
 	end;
 encode_quoted_printable(<<>>, Acc, _L) ->
 	list_to_binary(lists:reverse(Acc));
@@ -937,6 +977,11 @@ encode_quoted_printable(<<H, T/binary>>, Acc, L) when H == $\s; H == $\t ->
 encode_quoted_printable(<<H, T/binary>>, Acc, L) ->
 	[A, B] = lists:flatten(io_lib:format("~2.16.0B", [H])),
 	encode_quoted_printable(T, [B, A, $= | Acc], L+3).
+
+insert_soft_newline([H | T], AfterPos) when AfterPos > 0 ->
+	[H | insert_soft_newline(T, AfterPos - 1)];
+insert_soft_newline(Str, 0) ->
+	[$\n, $\r, $= | Str].
 
 get_default_encoding() ->
 	<<"utf-8//IGNORE">>.
@@ -971,12 +1016,12 @@ rfc2047_utf8_encode(T, Acc, WordLen, Char) when WordLen + length(Char) > 73 ->
 rfc2047_utf8_encode([], Acc, _WordLen, Char) ->
     lists:reverse("=?" ++ Char ++ Acc);
 
-%% ASCII characters dont encode except space, ?, _, =, and .
+%% Printable ASCII characters dont encode except space, ?, _, = and .
 rfc2047_utf8_encode([C|T], Acc, WordLen, Char) when C > 32 andalso C < 127 andalso C /= 32
     andalso C /= $? andalso C /= $_ andalso C /= $= andalso C /= $. ->
     rfc2047_utf8_encode(T, Char ++ Acc, WordLen+length(Char), [C]);
 %% Encode all other ASCII
-rfc2047_utf8_encode([C|T], Acc, WordLen, Char) when C >= 32 andalso C < 127 ->
+rfc2047_utf8_encode([C|T], Acc, WordLen, Char) when C > 0 andalso C =< 192 ->
     rfc2047_utf8_encode(T, Char ++ Acc, WordLen+length(Char), encode_byte(C));
 %% First byte of UTF-8 sequence
 %% ensure that encoded 2-4 byte UTF-8 characters keept in one line
@@ -1052,7 +1097,6 @@ dkim_sign_email(Headers, Body, Opts) ->
 	CanHeaders = dkim_canonicalize_headers(Headers1, HdrsCanT),
 	[DkimHeaderNoB] = dkim_canonicalize_headers([dkim_make_header([{b, undefined} | Tags])], HdrsCanT),
 	DataHash = dkim_hash_data(CanHeaders, DkimHeaderNoB),
-	%% io:format("~s~n~n", [base64:encode(DataHash)]),
 	%% sign
 	Signature = dkim_sign(DataHash, PrivateKey),
 	DkimHeader = dkim_make_header([{b, Signature} | Tags]),
@@ -1484,6 +1528,16 @@ parse_example_mails_test_() ->
 				?assertEqual(?IMAGE_MD5, erlang:md5(element(5, Image)))
 			end
 		},
+		{"alternative text/html with calendar attachment.",
+			fun() ->
+				Decoded = Getmail("message-text-html-attachment.eml"),
+				?assertMatch({<<"multipart">>, <<"mixed">>, _, _, [
+					{<<"multipart">>, <<"alternative">>, _, _, [
+						{<<"text">>, <<"plain">>, _, _, _}, 
+						{<<"text">>, <<"html">>, _, _, _}]}, 
+					{<<"text">>, <<"calendar">>, _, _, _}]}, Decoded)
+			end
+		},
 		{"Outlook 2007 with leading tabs in quoted-printable.",
 			fun() ->
 				Decoded = Getmail("outlook-2007.eml"),
@@ -1515,7 +1569,7 @@ parse_example_mails_test_() ->
 				?assertMatch({<<"text">>, <<"plain">>, _, _, _}, Toptext),
 				?assertEqual(<<"This is rich text.\r\n\r\nThe list is html.\r\n\r\nAttchments:\r\nan email containing an attachment of an email.\r\nan email of only plain text.\r\nan image\r\nan rtf file.\r\n">>, element(5, Toptext)),
 				?assertEqual(9, length(element(5, Topmultipart))),
-				[Html, Messagewithin, _Brhtml, _Message, _Brhtml, Image, _Brhtml, Rtf, _Brhtml] = element(5, Topmultipart),
+				[Html, Messagewithin, Brhtml, _Message, Brhtml, Image, Brhtml, Rtf, Brhtml] = element(5, Topmultipart),
 				?assertMatch({<<"text">>, <<"html">>, _, _, _}, Html),
 				?assertEqual(<<"<html><body style=\"word-wrap: break-word; -webkit-nbsp-mode: space; -webkit-line-break: after-white-space; \"><b>This</b> is <i>rich</i> text.<div><br></div><div>The list is html.</div><div><br></div><div>Attchments:</div><div><ul class=\"MailOutline\"><li>an email containing an attachment of an email.</li><li>an email of only plain text.</li><li>an image</li><li>an rtf file.</li></ul></div><div></div></body></html>">>, element(5, Html)),
 
@@ -1742,6 +1796,33 @@ decode_quoted_printable_test_() ->
 		}
 	].
 
+valid_smtp_mime_7bit_test() ->
+	?assert(valid_7bit(<<>>)),
+	?assert(valid_7bit(<<"abcdefghijklmnopqrstuvwxyz0123456789">>)),
+	?assert(valid_7bit(<<"abc\r\ndef">>)),
+	AllValidRange = (lists:seq(1, $\n - 1)
+					 ++ lists:seq($\n + 1, $\r - 1)
+					 ++ lists:seq($\r + 1, 127)),
+	?assert(valid_7bit(list_to_binary(AllValidRange))),
+	?assertNot(valid_7bit(<<"\n">>)),
+	?assertNot(valid_7bit(<<"\r">>)),
+	?assertNot(valid_7bit(<<"abc\ndef">>)),
+	?assertNot(valid_7bit(<<"abc\rdef">>)),
+	?assertNot(valid_7bit(<<"abc\n\rdef">>)),
+	?assertNot(valid_7bit(<<128, 200, 255>>)),
+	?assertNot(valid_7bit(<<0, 0, 0>>)),
+	?assertNot(valid_7bit(<<"hello", 128, 0, 200>>)),
+	%% Long lines
+	Line800 = binary:copy(<<$a>>, 800),
+	?assertNot(has_lines_over_998(Line800)),
+	Many800Lines = list_to_binary(lists:join("\r\n", lists:duplicate(10, Line800))),
+	?assertNot(has_lines_over_998(Many800Lines)),
+	Line1000 = binary:copy(<<$a>>, 1000),
+	?assert(has_lines_over_998(Line1000)),
+	Many1000Lines = list_to_binary(lists:join("\r\n", lists:duplicate(10, Line1000))),
+	?assert(has_lines_over_998(Many1000Lines)),
+	?assert(has_lines_over_998(<<Line800/binary, "\r\n", Line1000/binary>>)).
+
 encode_quoted_printable_test_() ->
 	[
 		{"bleh",
@@ -1879,6 +1960,10 @@ rfc2047_decode_test_() ->
 	].
 
 encoding_test_() ->
+	Getmail = fun(File) ->
+		{ok, Email} = file:read_file(filename:join("test/fixtures/", File)),
+		decode(Email)
+	end,
 	[
 		{"Simple email",
 			fun() ->
@@ -2007,6 +2092,14 @@ encoding_test_() ->
 									"HTML and is base64",
 									"encoded\r\n\r\n</body></html>">>}]},
 						Result)
+			end
+		},
+		{"multipart/mixed email with multipart/alternative does not add an extra empty lines",
+			fun() ->
+					Email = Getmail("message-text-html-attachment.eml"),
+					Encoded = encode(Email),
+					Re = re:run(Encoded, "(?:\\r\\n){3}", [global, {capture, all, binary}]),
+					?assertMatch({match, [_]}, Re)
 			end
 		},
 		{"Missing headers should be added",
@@ -2334,7 +2427,6 @@ dkim_sign_test_() ->
 			  Enc = encode(Email, Options),
 			  file:write_file("/home/seriy/relaxed-signed.eml", Enc),
 			  {_, _, [{DkimHdrName, DkimHdrVal} | _], _, _} = decode(Enc),
-			  %% io:format(user, "~p", [DkimHdrVal]),
 			  ?assertEqual(<<"DKIM-Signature">>, DkimHdrName),
 			  ?assertEqual(
 				 <<"s=foo.bar; h=from:to:subject:date; d=example.com; c=relaxed/simple; "
